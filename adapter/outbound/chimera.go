@@ -81,6 +81,18 @@ func (c *Chimera) StreamConnContext(ctx context.Context, conn net.Conn, metadata
 		return nil, fmt.Errorf("%s target connect: %w", c.addr, err)
 	}
 
+	// Chimera v2: wait for the server's dial-confirmation so the connection
+	// is only handed back once the target is actually established.
+	status2, err := chimera.ReadSessionResponse(pc)
+	if err != nil {
+		pc.Close()
+		return nil, fmt.Errorf("%s connect result: %w", c.addr, err)
+	}
+	if status2 != chimera.StatusOK {
+		pc.Close()
+		return nil, fmt.Errorf("%s server dial failed: status %d", c.addr, status2)
+	}
+
 	return pc, nil
 }
 
