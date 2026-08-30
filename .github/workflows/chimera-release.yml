@@ -1,0 +1,101 @@
+name: Chimera Release
+
+on:
+  push:
+    tags:
+      - "v*-chimera.*"
+
+permissions:
+  contents: write
+
+env:
+  GOTOOLCHAIN: local
+  SKIP_INTEROP_TEST: "1"
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.13"
+      - run: test -z "$(git status --porcelain)"
+      - run: go test ./... -tags with_gvisor -count=1
+      - run: go test -race ./transport/chimera ./adapter/outbound -tags with_gvisor -count=1
+      - run: go vet ./...
+      - run: go install golang.org/x/vuln/cmd/govulncheck@latest
+      - run: govulncheck ./...
+
+  build:
+    needs: verify
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            asset: mihomo-linux-amd64-chimera
+          - goos: windows
+            asset: mihomo-windows-amd64-chimera.exe
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.13"
+      - run: go install golang.org/x/vuln/cmd/govulncheck@latest
+      - name: Build clean with_gvisor asset
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: amd64
+          GOAMD64: v1
+          CGO_ENABLED: "0"
+        run: |
+          mkdir -p "$RUNNER_TEMP/chimera-release"
+          SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)
+          BUILD_TIME=$(date -u -d "@$SOURCE_DATE_EPOCH" '+%Y-%m-%dT%H:%M:%SZ')
+          go build -tags with_gvisor -trimpath \
+            -ldflags "-s -w -buildid= -X github.com/metacubex/mihomo/constant.Version=$GITHUB_REF_NAME -X github.com/metacubex/mihomo/constant.BuildTime=$BUILD_TIME" \
+            -o "$RUNNER_TEMP/chimera-release/${{ matrix.asset }}" .
+          go version -m "$RUNNER_TEMP/chimera-release/${{ matrix.asset }}" | tee "$RUNNER_TEMP/build-meta.txt"
+          grep -F "vcs.revision=$GITHUB_SHA" "$RUNNER_TEMP/build-meta.txt"
+          grep -F "vcs.modified=false" "$RUNNER_TEMP/build-meta.txt"
+          test -z "$(git status --porcelain)"
+      - name: Binary vulnerability scan
+        run: govulncheck -mode=binary "$RUNNER_TEMP/chimera-release/${{ matrix.asset }}" | tee "$RUNNER_TEMP/chimera-release/${{ matrix.asset }}-govulncheck.txt"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ runner.temp }}/chimera-release/${{ matrix.asset }}*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Generate checksums
+        working-directory: dist
+        run: sha256sum mihomo-* > checksums-sha256.txt
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat > release-notes.md <<'EOF'
+          Native Chimera v0.5 HTTP/3 CONNECT support for mihomo.
+
+          Breaking change: v0.5 QUIC is incompatible with v0.3/v0.4 raw QUIC. Upgrade the matching Chimera server first or at the same time. TCP/REALITY remains compatible.
+
+          `mode: quic` never pre-dials TCP. `mode: auto` uses the configured QUIC budget and creates TCP only after failure. QUIC carries TCP CONNECT streams; UDP ASSOCIATE is not implemented.
+
+          Both release binaries are built with `with_gvisor`, clean VCS metadata, SHA-256 checksums, and attached binary govulncheck reports.
+          EOF
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file release-notes.md
+          gh release upload "$GITHUB_REF_NAME" dist/* --clobber
