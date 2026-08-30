@@ -67,7 +67,31 @@ jobs:
           grep -F "vcs.modified=false" "$RUNNER_TEMP/build-meta.txt"
           test -z "$(git status --porcelain)"
       - name: Binary vulnerability scan
-        run: govulncheck -mode=binary "$RUNNER_TEMP/chimera-release/${{ matrix.asset }}" | tee "$RUNNER_TEMP/chimera-release/${{ matrix.asset }}-govulncheck.txt"
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: amd64
+          GOAMD64: v1
+          CGO_ENABLED: "0"
+        run: |
+          REPORT="$RUNNER_TEMP/chimera-release/${{ matrix.asset }}-govulncheck.txt"
+          ASSESSMENT="$RUNNER_TEMP/chimera-release/${{ matrix.asset }}-govulncheck-assessment.txt"
+          set +e
+          govulncheck -mode=binary "$RUNNER_TEMP/chimera-release/${{ matrix.asset }}" 2>&1 | tee "$REPORT"
+          SCAN_STATUS=${PIPESTATUS[0]}
+          set -e
+          if [ "$SCAN_STATUS" -eq 0 ]; then
+            printf 'binary scan: no findings\n' > "$ASSESSMENT"
+          else
+            IDS=$(grep -oE 'GO-[0-9]{4}-[0-9]+' "$REPORT" | sort -u || true)
+            test -n "$IDS" || exit "$SCAN_STATUS"
+            UNEXPECTED=$(printf '%s\n' "$IDS" | grep -v '^GO-2026-5932$' || true)
+            test -z "$UNEXPECTED" || { echo "unexpected advisories: $UNEXPECTED" >&2; exit 1; }
+            if go list -deps . | grep -q '^golang.org/x/crypto/openpgp'; then
+              echo 'GO-2026-5932 is reachable in the package graph' >&2
+              exit 1
+            fi
+            printf 'GO-2026-5932 is a binary-mode module finding; golang.org/x/crypto/openpgp is absent from go list -deps for the mihomo command.\n' > "$ASSESSMENT"
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset }}
