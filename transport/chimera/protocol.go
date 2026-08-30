@@ -1,11 +1,8 @@
 package chimera
 
 import (
-	"bytes"
-	"crypto/hmac"
 	"crypto/ecdh"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
@@ -122,6 +119,8 @@ func (a *Address) String() string {
 	switch a.Type {
 	case AtypDomain:
 		return fmt.Sprintf("%s:%d", a.Domain, a.Port)
+	case AtypIPv6:
+		return fmt.Sprintf("[%s]:%d", a.IP.String(), a.Port)
 	default:
 		return fmt.Sprintf("%s:%d", a.IP.String(), a.Port)
 	}
@@ -134,6 +133,12 @@ func WriteAddress(w io.Writer, addr *Address) error {
 		buf = append(buf, AtypIPv4)
 		buf = append(buf, addr.IP.To4()...)
 	case AtypDomain:
+		if len(addr.Domain) == 0 {
+			return errors.New("chimera: empty domain")
+		}
+		if len(addr.Domain) > 255 {
+			return errors.New("chimera: domain too long")
+		}
 		buf = append(buf, AtypDomain)
 		buf = append(buf, byte(len(addr.Domain)))
 		buf = append(buf, addr.Domain...)
@@ -236,57 +241,3 @@ func GenerateKeyPair() (privB64, pubB64 string, err error) {
 	return base64.RawURLEncoding.EncodeToString(priv),
 		base64.RawURLEncoding.EncodeToString(pub), nil
 }
-
-// --- QUIC v2 protocol helpers (mirror of chimera-core internal/chimera v2) ---
-
-const (
-	QUICVersion  = 0x02
-	QUICNonceLen = 8
-	QUICHMACLen  = 32
-	QUICHeaderLen = 4 + 1 + 1 + 1 + QUICNonceLen + QUICHMACLen
-
-	QUICStatusOK        = 0x00
-	QUICStatusDialError = 0x01
-)
-
-// WriteQUICConnect writes the v2 authed connect frame.
-func WriteQUICConnect(w io.Writer, cmd byte, password string, addr *Address) error {
-	nonce := make([]byte, QUICNonceLen)
-	if _, err := rand.Read(nonce); err != nil {
-		return err
-	}
-	mac := hmac.New(sha256.New, []byte(password))
-	mac.Write(nonce)
-	auth := mac.Sum(nil)
-
-	buf := make([]byte, 0, QUICHeaderLen+8+len(addr.Domain))
-	buf = append(buf, MagicByte0, MagicByte1, MagicByte2, MagicByte3)
-	buf = append(buf, QUICVersion)
-	buf = append(buf, cmd)
-	buf = append(buf, QUICNonceLen)
-	buf = append(buf, nonce...)
-	buf = append(buf, auth...)
-	var addrBuf bytes.Buffer
-	if err := WriteAddress(&addrBuf, addr); err != nil {
-		return err
-	}
-	buf = append(buf, addrBuf.Bytes()...)
-	_, err := w.Write(buf)
-	return err
-}
-
-// ReadQUICResult reads the server's dial-confirmation frame.
-func ReadQUICResult(r io.Reader) (byte, error) {
-	resp := make([]byte, 8)
-	if _, err := io.ReadFull(r, resp); err != nil {
-		return 0, err
-	}
-	if resp[0] != MagicByte0 || resp[1] != MagicByte1 || resp[2] != MagicByte2 || resp[3] != MagicByte3 {
-		return 0, ErrBadMagic
-	}
-	if resp[4] != QUICVersion {
-		return 0, ErrVersionMismatch
-	}
-	return resp[5], nil
-}
-

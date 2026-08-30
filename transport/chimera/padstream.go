@@ -59,13 +59,13 @@ type PadStream struct {
 	raw    io.ReadWriteCloser
 	policy Policy
 
-	writeMu     sync.Mutex
-	framesSent  int
-	readBuf     []byte
-	readStage   int // 0=header, 1=padding, 2=payload
+	writeMu        sync.Mutex
+	framesSent     int
+	readBuf        []byte
+	readStage      int // 0=header, 1=padding, 2=payload
 	readPayloadLen uint16
-	readPadLen  uint16
-	readPadSkip int
+	readPadLen     uint16
+	readPadSkip    int
 }
 
 func NewPaddingStream(raw io.ReadWriteCloser, p Policy) *PadStream {
@@ -193,5 +193,3 @@ func (c *PadStream) Read(b []byte) (int, error) {
 func (c *PadStream) Close() error {
 	return c.raw.Close()
 }
-
-

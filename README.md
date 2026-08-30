@@ -42,6 +42,8 @@ Configuration example is located at [/docs/config.yaml](https://github.com/MetaC
 
 Documentation can be found in [mihomo Docs](https://wiki.metacubex.one/).
 
+Native Chimera v0.5 configuration and mode behavior are documented in [docs/chimera.md](docs/chimera.md).
+
 ## For development
 
 Requirements:

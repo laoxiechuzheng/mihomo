@@ -1,0 +1,70 @@
+name: Chimera CI
+
+on:
+  push:
+    branches:
+      - chimera
+      - "feature/**"
+  pull_request:
+    branches:
+      - chimera
+  workflow_dispatch:
+
+concurrency:
+  group: "chimera-ci-${{ github.ref }}"
+  cancel-in-progress: true
+
+env:
+  CGO_ENABLED: "0"
+  GOTOOLCHAIN: local
+  SKIP_INTEROP_TEST: "1"
+
+jobs:
+  focused:
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.13"
+      - run: go test ./transport/chimera ./adapter/outbound -tags with_gvisor -count=1
+      - run: go build -tags with_gvisor ./...
+      - run: go run -tags with_gvisor . -t -f test/chimera-v05.yaml
+
+  full:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.13"
+      - run: go test ./... -tags with_gvisor -count=1
+      - run: go vet ./...
+      - run: go run -tags with_gvisor . -t -f test/chimera-v05.yaml
+
+  race:
+    runs-on: ubuntu-latest
+    env:
+      CGO_ENABLED: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.13"
+      - run: go test -race ./transport/chimera ./adapter/outbound -tags with_gvisor -count=1
+
+  vuln:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.13"
+      - run: go install golang.org/x/vuln/cmd/govulncheck@latest
+      - run: govulncheck ./...
