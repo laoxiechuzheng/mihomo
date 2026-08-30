@@ -119,6 +119,8 @@ func (a *Address) String() string {
 	switch a.Type {
 	case AtypDomain:
 		return fmt.Sprintf("%s:%d", a.Domain, a.Port)
+	case AtypIPv6:
+		return fmt.Sprintf("[%s]:%d", a.IP.String(), a.Port)
 	default:
 		return fmt.Sprintf("%s:%d", a.IP.String(), a.Port)
 	}
@@ -131,6 +133,12 @@ func WriteAddress(w io.Writer, addr *Address) error {
 		buf = append(buf, AtypIPv4)
 		buf = append(buf, addr.IP.To4()...)
 	case AtypDomain:
+		if len(addr.Domain) == 0 {
+			return errors.New("chimera: empty domain")
+		}
+		if len(addr.Domain) > 255 {
+			return errors.New("chimera: domain too long")
+		}
 		buf = append(buf, AtypDomain)
 		buf = append(buf, byte(len(addr.Domain)))
 		buf = append(buf, addr.Domain...)
