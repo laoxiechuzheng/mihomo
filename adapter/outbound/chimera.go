@@ -2,6 +2,7 @@ package outbound
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"net"
 	"strconv"
@@ -16,6 +17,9 @@ type Chimera struct {
 	option         *ChimeraOption
 	realityConfig  *tlsC.RealityConfig
 	clientFingerprint tlsC.UClientHelloID
+	quicMode       string
+	quicPassword   string
+	quicFP         string
 }
 
 type ChimeraOption struct {
@@ -27,6 +31,8 @@ type ChimeraOption struct {
 	ShortID           string         `proxy:"short-id,omitempty"`
 	PublicKey         string         `proxy:"public-key"`
 	Fingerprint       string         `proxy:"client-fingerprint,omitempty"`
+	Mode              string         `proxy:"mode,omitempty"`
+	QuicFingerprint   string         `proxy:"quic-fp,omitempty"`
 	UDP               bool           `proxy:"udp,omitempty"`
 	SkipCertVerify    bool           `proxy:"skip-cert-verify,omitempty"`
 }
@@ -52,6 +58,18 @@ func metadataToChimeraAddr(metadata *C.Metadata) *chimera.Address {
 
 // StreamConnContext implements C.ProxyAdapter
 func (c *Chimera) StreamConnContext(ctx context.Context, conn net.Conn, metadata *C.Metadata) (net.Conn, error) {
+	if c.quicMode == "quic" {
+		// QUIC path uses its own transport; the TCP conn from dialer is unused.
+		conn.Close()
+		return c.streamQuic(ctx, metadata)
+	}
+	if c.quicMode == "auto" {
+		qc, err := c.streamQuic(ctx, metadata)
+		if err == nil {
+			return qc, nil
+		}
+		// fall through to TCP
+	}
 	realityConn, err := tlsC.GetRealityConn(ctx, conn, c.clientFingerprint, c.option.SNI, c.realityConfig)
 	if err != nil {
 		return nil, fmt.Errorf("%s connect error: %w", c.addr, err)
@@ -94,6 +112,33 @@ func (c *Chimera) StreamConnContext(ctx context.Context, conn net.Conn, metadata
 	}
 
 	return pc, nil
+}
+
+// streamQuic dials the camouflaged QUIC transport and returns the target
+// stream as a net.Conn. Password is derived from REALITY credentials.
+func (c *Chimera) streamQuic(ctx context.Context, metadata *C.Metadata) (net.Conn, error) {
+	qc, err := chimera.DialQuic(ctx, c.addr, c.quicPassword, c.quicFP)
+	if err != nil {
+		return nil, fmt.Errorf("%s quic dial: %w", c.addr, err)
+	}
+	stream, err := qc.DialTarget(ctx, metadataToChimeraAddr(metadata))
+	if err != nil {
+		qc.Close()
+		return nil, fmt.Errorf("%s quic target: %w", c.addr, err)
+	}
+	// Wrap to close the whole QUIC connection when the stream closes.
+	return &quicStreamConn{Conn: stream, qc: qc}, nil
+}
+
+type quicStreamConn struct {
+	net.Conn
+	qc *chimera.QuicClient
+}
+
+func (q *quicStreamConn) Close() error {
+	err := q.Conn.Close()
+	q.qc.Close()
+	return err
 }
 
 // DialContext implements C.ProxyAdapter
@@ -145,6 +190,28 @@ func NewChimera(option ChimeraOption) (*Chimera, error) {
 		}
 	}
 
+	// Transport mode: tcp (default) | quic | auto (quic first, tcp fallback)
+	mode := option.Mode
+	if mode == "" {
+		mode = "tcp"
+	}
+	switch mode {
+	case "tcp", "quic", "auto":
+	default:
+		return nil, fmt.Errorf("chimera: unknown mode %q (want tcp, quic or auto)", mode)
+	}
+	var quicPassword string
+	if mode != "tcp" {
+		if option.QuicFingerprint == "" {
+			return nil, fmt.Errorf("chimera: mode %s requires quic-fp (server prints it at startup)", mode)
+		}
+		sid, err := hex.DecodeString(option.ShortID)
+		if err != nil || len(sid) == 0 {
+			return nil, fmt.Errorf("chimera: invalid short-id for quic password derivation")
+		}
+		quicPassword = chimera.DeriveQUICPassword(sid, option.PublicKey)
+	}
+
 	addr := net.JoinHostPort(option.Server, strconv.Itoa(option.Port))
 	outbound := &Chimera{
 		Base: NewBase(BaseOption{
@@ -162,6 +229,9 @@ func NewChimera(option ChimeraOption) (*Chimera, error) {
 		option:            &option,
 		realityConfig:     realityConfig,
 		clientFingerprint: clientFingerprint,
+		quicMode:          mode,
+		quicPassword:      quicPassword,
+		quicFP:            option.QuicFingerprint,
 	}
 	outbound.dialer = option.NewDialer(outbound.DialOptions())
 	return outbound, nil
