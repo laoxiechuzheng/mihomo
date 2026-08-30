@@ -1,0 +1,26 @@
+mixed-port: 7890
+mode: rule
+log-level: silent
+
+proxies:
+  - name: chimera-v05-test
+    type: chimera
+    server: 192.0.2.1
+    port: 9443
+    sni: proxy.example
+    public-key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    short-id: "0102030405060708"
+    client-fingerprint: chrome
+    mode: auto
+    quic-psk: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    quic-fp: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    auto-quic-timeout: 1200
+
+proxy-groups:
+  - name: PROXY
+    type: select
+    proxies:
+      - chimera-v05-test
+
+rules:
+  - MATCH,PROXY
