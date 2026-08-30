@@ -10,6 +10,7 @@ on:
       - Alpha
     tags:
       - "v*"
+      - "!v*-chimera.*"
       
 jobs:
   # Send "core-updated" to MetaCubeX/ClashMetaForAndroid to trigger update-dependencies

@@ -9,6 +9,7 @@ on:
       - Alpha
     tags:
       - "v*"
+      - "!v*-chimera.*"
   pull_request:
     branches:
       - Alpha
