@@ -2,120 +2,214 @@ package chimera
 
 import (
 	"bytes"
-	"crypto/hmac"
-	"crypto/sha256"
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
 	"crypto/x509"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"net"
+	"strconv"
+	"strings"
+	"sync"
 	"time"
 
+	mhttp "github.com/metacubex/http"
 	mquic "github.com/metacubex/quic-go"
+	"github.com/metacubex/quic-go/http3"
 	mtls "github.com/metacubex/tls"
 )
 
-// QUIC client side of the chimera v2 protocol (h3 camouflage mode).
-// Mirrors chimera-core/internal/quicx: ALPN h3, mandatory cert fingerprint
-// pinning, per-stream nonce+HMAC auth, dial-confirmation result frame.
-
-const h3ALPN = "h3"
-
 type QuicClient struct {
-	conn     *mquic.Conn
-	password string
+	conn       *mquic.Conn
+	h3         *http3.ClientConn
+	authKey    []byte
+	serverName string
+	closeOnce  sync.Once
+	closeErr   error
 }
 
-func DeriveQUICPassword(shortID []byte, pubKeyB64 string) string {
-	mac := hmac.New(sha256.New, []byte("chimera-quic-key-v2"))
-	mac.Write(shortID)
-	mac.Write([]byte(pubKeyB64))
-	return string(mac.Sum(nil))
-}
-
-func DialQuic(ctx context.Context, serverAddr, password, certFingerprint string) (*QuicClient, error) {
-	if password == "" {
-		return nil, errors.New("chimera-quic: empty auth password")
+func DialQuic(ctx context.Context, serverAddr, serverName string, authKey []byte, certFingerprint string) (*QuicClient, error) {
+	serverAddr = strings.TrimSpace(serverAddr)
+	serverName = strings.ToLower(strings.TrimSpace(serverName))
+	if serverAddr == "" {
+		return nil, errors.New("chimera-h3: server address is required")
 	}
-	if certFingerprint == "" {
-		return nil, errors.New("chimera-quic: certificate fingerprint required (mode quic/auto)")
+	if serverName == "" {
+		return nil, errors.New("chimera-h3: server name is required")
 	}
-	fp, err := hex.DecodeString(certFingerprint)
-	if err != nil || len(fp) != 32 {
-		return nil, errors.New("chimera-quic: invalid fingerprint")
+	if len(authKey) != h3AuthKeyLen {
+		return nil, errors.New("chimera-h3: authentication key must be exactly 32 bytes")
 	}
-	tlsConf := &mtls.Config{
-		InsecureSkipVerify: true, // pinned by fingerprint below
-		NextProtos:         []string{h3ALPN},
-		VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
-			if len(rawCerts) == 0 {
-				return errors.New("chimera-quic: no certs")
-			}
-			sum := sha256.Sum256(rawCerts[0])
-			if !bytes.Equal(sum[:], fp) {
-				return errors.New("chimera-quic: cert fingerprint mismatch")
-			}
-			return nil
-		},
-	}
-	conn, err := mquic.DialAddrEarly(ctx, serverAddr, tlsConf, &mquic.Config{MaxIdleTimeout: 120 * time.Second})
+	tlsConfig, err := pinnedTLSConfig(serverName, certFingerprint)
 	if err != nil {
 		return nil, err
 	}
-	return &QuicClient{conn: conn, password: password}, nil
+	quicConfig := &mquic.Config{
+		HandshakeIdleTimeout: 5 * time.Second,
+		MaxIdleTimeout:       60 * time.Second,
+		KeepAlivePeriod:      20 * time.Second,
+		MaxIncomingStreams:   -1,
+	}
+	conn, err := mquic.DialAddr(ctx, serverAddr, tlsConfig, quicConfig)
+	if err != nil {
+		return nil, err
+	}
+	transport := &http3.Transport{DisableCompression: true}
+	return &QuicClient{
+		conn:       conn,
+		h3:         transport.NewClientConn(conn),
+		authKey:    append([]byte(nil), authKey...),
+		serverName: serverName,
+	}, nil
 }
 
 func (q *QuicClient) Close() error {
-	if q.conn != nil {
-		q.conn.CloseWithError(0, "")
+	if q == nil {
+		return nil
 	}
-	return nil
+	q.closeOnce.Do(func() {
+		if q.h3 != nil {
+			q.closeErr = q.h3.CloseWithError(0, "client closed")
+		} else if q.conn != nil {
+			q.closeErr = q.conn.CloseWithError(0, "client closed")
+		}
+	})
+	return q.closeErr
 }
 
-// DialTarget opens a stream, authenticates, and waits for the dial result.
 func (q *QuicClient) DialTarget(ctx context.Context, addr *Address) (net.Conn, error) {
-	stream, err := q.conn.OpenStreamSync(ctx)
+	authority, err := authorityFromAddress(addr)
 	if err != nil {
 		return nil, err
 	}
-	stream.SetWriteDeadline(time.Now().Add(10 * time.Second))
-	if err := WriteQUICConnect(stream, CmdConnect, q.password, addr); err != nil {
-		stream.Close()
-		return nil, err
-	}
-	stream.SetWriteDeadline(time.Time{})
-
-	stream.SetReadDeadline(time.Now().Add(15 * time.Second))
-	status, err := ReadQUICResult(stream)
-	stream.SetReadDeadline(time.Time{})
+	authorization, err := signAuthorization(q.authKey, mhttp.MethodConnect, authority, q.serverName, time.Now(), rand.Reader)
 	if err != nil {
-		stream.Close()
 		return nil, err
 	}
-	if status != QUICStatusOK {
-		stream.Close()
-		return nil, fmt.Errorf("chimera-quic: server dial failed (status %d)", status)
+	stream, err := q.h3.OpenRequestStream(ctx)
+	if err != nil {
+		return nil, err
 	}
-	return &quicNetConn{Stream: stream}, nil
-}
-
-// quicNetConn adapts a QUIC stream to net.Conn.
-type quicNetConn struct {
-	*mquic.Stream
-}
-
-func (c *quicNetConn) LocalAddr() net.Addr  { return dummyAddr{} }
-func (c *quicNetConn) RemoteAddr() net.Addr { return dummyAddr{} }
-
-func (c *quicNetConn) SetDeadline(t time.Time) error {
-	if err := c.SetReadDeadline(t); err != nil {
-		return err
+	cancelStream := func() {
+		stream.CancelRead(mquic.StreamErrorCode(http3.ErrCodeRequestCanceled))
+		stream.CancelWrite(mquic.StreamErrorCode(http3.ErrCodeRequestCanceled))
 	}
-	return c.SetWriteDeadline(t)
+	request, err := mhttp.NewRequestWithContext(ctx, mhttp.MethodConnect, "https://"+authority, nil)
+	if err != nil {
+		cancelStream()
+		return nil, err
+	}
+	request.Host = authority
+	request.Header.Set("Authorization", authorization)
+	request.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+	if err := stream.SendRequestHeader(request); err != nil {
+		cancelStream()
+		return nil, err
+	}
+	response, err := stream.ReadResponse()
+	if err != nil {
+		cancelStream()
+		return nil, err
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		_, _ = io.CopyN(io.Discard, response.Body, 4<<10)
+		_ = response.Body.Close()
+		stream.CancelWrite(mquic.StreamErrorCode(http3.ErrCodeRequestCanceled))
+		return nil, fmt.Errorf("chimera-h3: CONNECT rejected with status %d", response.StatusCode)
+	}
+	streamConn := &h3RequestConn{
+		RequestStream: stream,
+		local:         q.conn.LocalAddr(),
+		remote:        q.conn.RemoteAddr(),
+	}
+	return newQuicStreamConn(streamConn, q.Close), nil
 }
 
-type dummyAddr struct{}
+func pinnedTLSConfig(serverName, fingerprint string) (*mtls.Config, error) {
+	fingerprintBytes, err := hex.DecodeString(strings.TrimSpace(fingerprint))
+	if err != nil || len(fingerprintBytes) != sha256.Size {
+		return nil, errors.New("chimera-h3: invalid certificate fingerprint")
+	}
+	return &mtls.Config{
+		InsecureSkipVerify: true,
+		ServerName:         serverName,
+		MinVersion:         mtls.VersionTLS13,
+		NextProtos:         []string{http3.NextProtoH3},
+		VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+			if len(rawCerts) == 0 {
+				return errors.New("chimera-h3: no server certificate")
+			}
+			sum := sha256.Sum256(rawCerts[0])
+			if !bytes.Equal(sum[:], fingerprintBytes) {
+				return errors.New("chimera-h3: certificate fingerprint mismatch")
+			}
+			return nil
+		},
+	}, nil
+}
 
-func (dummyAddr) Network() string { return "chimera-quic" }
-func (dummyAddr) String() string  { return "chimera-quic" }
+func authorityFromAddress(addr *Address) (string, error) {
+	if addr == nil || addr.Port == 0 {
+		return "", errors.New("chimera-h3: invalid target address")
+	}
+	port := strconv.Itoa(int(addr.Port))
+	switch addr.Type {
+	case AtypDomain:
+		domain := strings.TrimSpace(addr.Domain)
+		if domain == "" {
+			return "", errors.New("chimera-h3: empty target domain")
+		}
+		return net.JoinHostPort(domain, port), nil
+	case AtypIPv4:
+		ip := addr.IP.To4()
+		if ip == nil {
+			return "", errors.New("chimera-h3: invalid IPv4 target")
+		}
+		return net.JoinHostPort(ip.String(), port), nil
+	case AtypIPv6:
+		ip := addr.IP.To16()
+		if ip == nil || addr.IP.To4() != nil {
+			return "", errors.New("chimera-h3: invalid IPv6 target")
+		}
+		return net.JoinHostPort(ip.String(), port), nil
+	default:
+		return "", errors.New("chimera-h3: unsupported target address type")
+	}
+}
+
+type h3RequestConn struct {
+	*http3.RequestStream
+	local  net.Addr
+	remote net.Addr
+}
+
+func (c *h3RequestConn) LocalAddr() net.Addr  { return c.local }
+func (c *h3RequestConn) RemoteAddr() net.Addr { return c.remote }
+
+type quicStreamConn struct {
+	net.Conn
+	closeOwner func() error
+	once       sync.Once
+	err        error
+}
+
+func newQuicStreamConn(conn net.Conn, closeOwner func() error) net.Conn {
+	return &quicStreamConn{Conn: conn, closeOwner: closeOwner}
+}
+
+func (c *quicStreamConn) Close() error {
+	c.once.Do(func() {
+		var streamErr, ownerErr error
+		if c.Conn != nil {
+			streamErr = c.Conn.Close()
+		}
+		if c.closeOwner != nil {
+			ownerErr = c.closeOwner()
+		}
+		c.err = errors.Join(streamErr, ownerErr)
+	})
+	return c.err
+}
