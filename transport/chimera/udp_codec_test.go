@@ -2,6 +2,7 @@ package chimera
 
 import (
 	"bytes"
+	"encoding/binary"
 	"testing"
 	"time"
 )
@@ -82,5 +83,20 @@ func TestUDPDatagramCodecMatchesV06WireFixture(t *testing.T) {
 	want := []byte{2, 0, 0, 0, 0, 0, 1, 'a', 'b', 'c'}
 	if len(frames) != 1 || !bytes.Equal(frames[0], want) {
 		t.Fatalf("frame = %x, want %x", frames, want)
+	}
+}
+
+func TestUDPDatagramCodecFailsClosedAfterMaxSequence(t *testing.T) {
+	encoder := newUDPFragmentEncoder(64)
+	encoder.nextSeq = ^uint32(0)
+	frames, err := encoder.Encode([]byte("last"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(frames) != 1 || binary.BigEndian.Uint32(frames[0][1:5]) != ^uint32(0) {
+		t.Fatalf("last sequence frame = %x", frames)
+	}
+	if _, err := encoder.Encode([]byte("must-not-wrap")); err == nil {
+		t.Fatal("fragment sequence wrapped instead of failing closed")
 	}
 }

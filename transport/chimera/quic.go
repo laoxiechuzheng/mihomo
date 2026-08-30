@@ -133,12 +133,27 @@ func (q *QuicClient) Close() error {
 }
 
 func (q *QuicClient) DialUDP(ctx context.Context, addr *Address) (*DatagramConn, error) {
-	if q == nil || q.h3 == nil || !q.enableDatagrams {
-		return nil, errors.New("chimera-h3: HTTP Datagrams are not enabled")
-	}
 	authority, err := authorityFromAddress(addr)
 	if err != nil {
 		return nil, err
+	}
+	return q.dialUDPAuthority(ctx, authority, udpTargetAddr{authority: authority}, q.Close)
+}
+
+func (q *QuicClient) dialUDP(ctx context.Context, addr *Address, reportedTarget net.Addr, closeOwner func() error) (*DatagramConn, error) {
+	authority, err := authorityFromAddress(addr)
+	if err != nil {
+		return nil, err
+	}
+	return q.dialUDPAuthority(ctx, authority, reportedTarget, closeOwner)
+}
+
+func (q *QuicClient) dialUDPAuthority(ctx context.Context, authority string, reportedTarget net.Addr, closeOwner func() error) (*DatagramConn, error) {
+	if q == nil || q.h3 == nil || !q.enableDatagrams {
+		return nil, errors.New("chimera-h3: HTTP Datagrams are not enabled")
+	}
+	if reportedTarget == nil {
+		return nil, errors.New("chimera-h3: UDP target is required")
 	}
 	authorization, err := signAuthorization(q.authKey, mhttp.MethodConnect, authority, q.serverName, time.Now(), rand.Reader)
 	if err != nil {
@@ -177,7 +192,7 @@ func (q *QuicClient) DialUDP(ctx context.Context, addr *Address) (*DatagramConn,
 		cancelStream()
 		return nil, fmt.Errorf("chimera-h3: UDP CONNECT rejected with status %d", response.StatusCode)
 	}
-	return newDatagramConn(stream, q.conn.LocalAddr(), q.conn.RemoteAddr(), udpTargetAddr{authority: authority}, q.udpMaxPacket, q.Close), nil
+	return newDatagramConn(stream, q.conn.LocalAddr(), q.conn.RemoteAddr(), reportedTarget, q.udpMaxPacket, closeOwner), nil
 }
 
 func (q *QuicClient) DialTarget(ctx context.Context, addr *Address) (net.Conn, error) {

@@ -233,10 +233,10 @@ func (c *Chimera) listenPacketQUIC(ctx context.Context, metadata *C.Metadata) (n
 		_ = quicConn.CloseWithError(0, "client setup failed")
 		return nil, fmt.Errorf("%s QUIC client: %w", c.addr, err)
 	}
-	packetConn, err = client.DialUDP(ctx, metadataToChimeraAddr(metadata))
+	packetConn, err = client.DialUDPMux(ctx)
 	if err != nil {
 		_ = client.Close()
-		return nil, fmt.Errorf("%s QUIC UDP target: %w", c.addr, err)
+		return nil, fmt.Errorf("%s QUIC UDP: %w", c.addr, err)
 	}
 	return packetConn, nil
 }
