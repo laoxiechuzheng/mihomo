@@ -1,5 +1,7 @@
 mihomo-win-v4.exe
 mihomo-linux-v4
+k5-*
+mihomo-v5-test.exe
 cfg-check.yaml
 e2e.yaml
 e2e-*.txt
