@@ -116,6 +116,7 @@ jobs:
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           cat > release-notes.md <<'EOF'
           Native Chimera v0.5 HTTP/3 CONNECT support for mihomo.
