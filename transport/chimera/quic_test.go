@@ -69,6 +69,40 @@ func TestH3ConnectRejectsWrongAuthKey(t *testing.T) {
 	}
 }
 
+func TestH3DatagramConnectRelaysUDPEcho(t *testing.T) {
+	key := bytes.Repeat([]byte{0x44}, 32)
+	serverName := "proxy.example"
+	echo := startUDPEchoServer(t)
+	echoAddr := echo.LocalAddr().(*net.UDPAddr)
+	serverAddr, fingerprint := startH3DatagramServer(t, serverName, key)
+	client, err := DialQuicWithDatagrams(context.Background(), serverAddr, serverName, key, fingerprint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+	conn, err := client.DialUDP(context.Background(), &Address{Type: AtypIPv4, IP: echoAddr.IP, Port: uint16(echoAddr.Port)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	payload := make([]byte, 3000)
+	for i := range payload {
+		payload[i] = byte(i)
+	}
+	if _, err := conn.WriteTo(payload, echoAddr); err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	buf := make([]byte, len(payload))
+	n, _, err := conn.ReadFrom(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != len(payload) || !bytes.Equal(buf[:n], payload) {
+		t.Fatalf("fragmented echo mismatch: got %d bytes, want %d", n, len(payload))
+	}
+}
+
 func TestDialQuicRejectsWrongCertificateFingerprint(t *testing.T) {
 	serverName := "proxy.example"
 	serverAddr, _ := startH3ConnectServer(t, serverName, bytes.Repeat([]byte{0x42}, 32))
@@ -126,6 +160,108 @@ func startTCPEchoServer(t *testing.T) net.Listener {
 		}
 	}()
 	return listener
+}
+
+func startUDPEchoServer(t *testing.T) net.PacketConn {
+	t.Helper()
+	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	go func() {
+		buf := make([]byte, 2048)
+		for {
+			n, addr, err := conn.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			_, _ = conn.WriteTo(buf[:n], addr)
+		}
+	}()
+	return conn
+}
+
+func startH3DatagramServer(t *testing.T, serverName string, authKey []byte) (string, string) {
+	t.Helper()
+	certificate, fingerprint := newTestCertificate(t, serverName)
+	packetConn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tlsConfig := http3.ConfigureTLSConfig(&mtls.Config{
+		Certificates: []mtls.Certificate{certificate},
+		MinVersion:   mtls.VersionTLS13,
+	})
+	listener, err := mquic.ListenEarly(packetConn, tlsConfig, &mquic.Config{
+		HandshakeIdleTimeout: 2 * time.Second,
+		MaxIdleTimeout:       10 * time.Second,
+		EnableDatagrams:      true,
+	})
+	if err != nil {
+		_ = packetConn.Close()
+		t.Fatal(err)
+	}
+	server := &http3.Server{
+		EnableDatagrams: true,
+		Handler: mhttp.HandlerFunc(func(w mhttp.ResponseWriter, r *mhttp.Request) {
+			if r.Method != mhttp.MethodConnect || r.Header.Get("Connect-Protocol") != "connect-udp" || !validateTestAuthorization(r.Header.Get("Authorization"), r.Method, r.Host, serverName, authKey, time.Now()) {
+				mhttp.Error(w, "Not Found", mhttp.StatusNotFound)
+				return
+			}
+			target, err := net.DialTimeout("udp", r.Host, 2*time.Second)
+			if err != nil {
+				mhttp.Error(w, "Bad Gateway", mhttp.StatusBadGateway)
+				return
+			}
+			defer target.Close()
+			streamer, ok := w.(http3.HTTPStreamer)
+			if !ok {
+				mhttp.Error(w, "Bad Gateway", mhttp.StatusBadGateway)
+				return
+			}
+			w.WriteHeader(mhttp.StatusOK)
+			stream := streamer.HTTPStream()
+			ctx, cancel := context.WithCancel(r.Context())
+			defer cancel()
+			done := make(chan struct{}, 2)
+			go func() {
+				defer func() { done <- struct{}{} }()
+				for {
+					data, err := stream.ReceiveDatagram(ctx)
+					if err != nil {
+						return
+					}
+					if _, err := target.Write(data); err != nil {
+						return
+					}
+				}
+			}()
+			go func() {
+				defer func() { done <- struct{}{} }()
+				buf := make([]byte, 2048)
+				for {
+					n, err := target.Read(buf)
+					if err != nil {
+						return
+					}
+					if err := stream.SendDatagram(append([]byte(nil), buf[:n]...)); err != nil {
+						return
+					}
+				}
+			}()
+			<-done
+			stream.CancelRead(0)
+			_ = stream.Close()
+		}),
+	}
+	t.Cleanup(func() {
+		_ = server.Close()
+		_ = listener.Close()
+		_ = packetConn.Close()
+	})
+	go func() { _ = server.ServeListener(listener) }()
+	return listener.Addr().String(), fingerprint
 }
 
 func startH3ConnectServer(t *testing.T, serverName string, authKey []byte) (string, string) {

@@ -5,12 +5,14 @@ import (
 	"encoding/base64"
 	"errors"
 	"net"
+	"net/netip"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	C "github.com/metacubex/mihomo/constant"
+	"github.com/metacubex/mihomo/transport/chimera"
 )
 
 func TestChimeraQUICModeNeverDialsTCP(t *testing.T) {
@@ -122,15 +124,88 @@ func TestNewChimeraRejectsInvalidAutoQUICTimeout(t *testing.T) {
 	}
 }
 
-func TestNewChimeraDoesNotAdvertiseUnsupportedUDP(t *testing.T) {
+func TestNewChimeraAdvertisesUDPOnlyForDatagramModes(t *testing.T) {
 	option := validChimeraQUICOption()
-	option.UDP = true
+	c, err := NewChimera(option)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.SupportUDP() {
+		t.Fatal("Chimera did not advertise UDP support in QUIC mode")
+	}
+	option.Mode = "tcp"
+	option.QuicPSK = ""
+	option.QuicFingerprint = ""
+	c, err = NewChimera(option)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.SupportUDP() {
+		t.Fatal("Chimera advertised UDP support in TCP mode")
+	}
+}
+
+func TestNewChimeraHonorsExplicitUDPDisable(t *testing.T) {
+	disabled := false
+	option := validChimeraQUICOption()
+	option.UDP = &disabled
 	c, err := NewChimera(option)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if c.SupportUDP() {
-		t.Fatal("Chimera advertised UDP support without UDP ASSOCIATE implementation")
+		t.Fatal("Chimera advertised UDP after explicit udp: false")
+	}
+}
+
+func TestChimeraListenPacketHonorsExplicitUDPDisable(t *testing.T) {
+	c := newChimeraSelectionHarness("quic")
+	c.option = &ChimeraOption{}
+	c.Base = NewBase(BaseOption{Name: "test", Addr: "127.0.0.1:9443", Type: C.Chimera, UDP: false})
+	c.listenPacketQUICFn = func(context.Context, *C.Metadata) (net.PacketConn, error) {
+		t.Fatal("QUIC UDP session opened despite udp: false")
+		return nil, nil
+	}
+	if _, err := c.ListenPacketContext(context.Background(), testChimeraMetadata()); err == nil {
+		t.Fatal("udp: false accepted a UDP association")
+	}
+}
+
+func TestChimeraListenPacketTCPModeRejectsUDP(t *testing.T) {
+	c := newChimeraSelectionHarness("tcp")
+	c.option = &ChimeraOption{}
+	c.Base = NewBase(BaseOption{Name: "test", Addr: "127.0.0.1:9443", Type: C.Chimera})
+	if _, err := c.ListenPacketContext(context.Background(), testChimeraMetadata()); err == nil {
+		t.Fatal("TCP mode accepted UDP")
+	}
+}
+
+func TestChimeraListenPacketQuicModeUsesQUIC(t *testing.T) {
+	c := newChimeraSelectionHarness("quic")
+	c.option = &ChimeraOption{}
+	c.Base = NewBase(BaseOption{Name: "test", Addr: "127.0.0.1:9443", Type: C.Chimera, UDP: true})
+	var calls atomic.Int32
+	c.listenPacketQUICFn = func(context.Context, *C.Metadata) (net.PacketConn, error) {
+		calls.Add(1)
+		return newTestPacketConn(), nil
+	}
+	pc, err := c.ListenPacketContext(context.Background(), testChimeraMetadata())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pc.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("QUIC packet dials = %d, want 1", got)
+	}
+}
+
+func TestMetadataToChimeraAddrPrefersHostOverFakeIP(t *testing.T) {
+	metadata := &C.Metadata{Host: "example.com", DstIP: netip.MustParseAddr("198.18.0.1"), DstPort: 443}
+	addr := metadataToChimeraAddr(metadata)
+	if addr.Type != chimera.AtypDomain || addr.Domain != "example.com" {
+		t.Fatalf("metadata address = %#v, want domain example.com", addr)
 	}
 }
 
@@ -168,6 +243,41 @@ func validChimeraQUICOption() ChimeraOption {
 		QuicPSK:         base64.RawURLEncoding.EncodeToString(make([]byte, 32)),
 	}
 }
+
+type testPacketConn struct {
+	closed atomic.Bool
+}
+
+func newTestPacketConn() *testPacketConn { return &testPacketConn{} }
+
+func (c *testPacketConn) ReadFrom([]byte) (int, net.Addr, error) {
+	if c.closed.Load() {
+		return 0, nil, net.ErrClosed
+	}
+	return 0, nil, errors.New("test packet conn has no queued datagrams")
+}
+
+func (c *testPacketConn) WriteTo(p []byte, _ net.Addr) (int, error) {
+	if c.closed.Load() {
+		return 0, net.ErrClosed
+	}
+	return len(p), nil
+}
+
+func (c *testPacketConn) Close() error {
+	c.closed.Store(true)
+	return nil
+}
+
+func (c *testPacketConn) LocalAddr() net.Addr              { return testPacketAddr("local") }
+func (c *testPacketConn) SetDeadline(time.Time) error      { return nil }
+func (c *testPacketConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *testPacketConn) SetWriteDeadline(time.Time) error { return nil }
+
+type testPacketAddr string
+
+func (a testPacketAddr) Network() string { return "udp" }
+func (a testPacketAddr) String() string  { return string(a) }
 
 type closeCountingConn struct {
 	net.Conn

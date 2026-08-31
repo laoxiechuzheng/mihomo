@@ -14,23 +14,26 @@ import (
 	tlsC "github.com/metacubex/mihomo/component/tls"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/transport/chimera"
+	"github.com/metacubex/mihomo/transport/tuic/common"
 )
 
 const defaultChimeraAutoQUICTimeout = 1200 * time.Millisecond
 
 type chimeraDialFunc func(context.Context, *C.Metadata) (net.Conn, error)
+type chimeraPacketDialFunc func(context.Context, *C.Metadata) (net.PacketConn, error)
 
 type Chimera struct {
 	*Base
-	option            *ChimeraOption
-	realityConfig     *tlsC.RealityConfig
-	clientFingerprint tlsC.UClientHelloID
-	quicMode          string
-	quicAuthKey       []byte
-	quicFP            string
-	autoQUICTimeout   time.Duration
-	dialTCPFn         chimeraDialFunc
-	dialQUICFn        chimeraDialFunc
+	option             *ChimeraOption
+	realityConfig      *tlsC.RealityConfig
+	clientFingerprint  tlsC.UClientHelloID
+	quicMode           string
+	quicAuthKey        []byte
+	quicFP             string
+	autoQUICTimeout    time.Duration
+	dialTCPFn          chimeraDialFunc
+	dialQUICFn         chimeraDialFunc
+	listenPacketQUICFn chimeraPacketDialFunc
 }
 
 type ChimeraOption struct {
@@ -46,13 +49,16 @@ type ChimeraOption struct {
 	QuicFingerprint string `proxy:"quic-fp,omitempty"`
 	QuicPSK         string `proxy:"quic-psk,omitempty"`
 	AutoQUICTimeout int    `proxy:"auto-quic-timeout,omitempty"`
-	UDP             bool   `proxy:"udp,omitempty"`
+	UDP             *bool  `proxy:"udp,omitempty"`
 	SkipCertVerify  bool   `proxy:"skip-cert-verify,omitempty"`
 }
 
 func metadataToChimeraAddr(metadata *C.Metadata) *chimera.Address {
 	addr := &chimera.Address{Port: metadata.DstPort}
-	if metadata.DstIP.Is4() {
+	if metadata.Host != "" {
+		addr.Type = chimera.AtypDomain
+		addr.Domain = metadata.Host
+	} else if metadata.DstIP.Is4() {
 		addr.Type = chimera.AtypIPv4
 		addr.IP = metadata.DstIP.AsSlice()
 	} else if metadata.DstIP.Is6() {
@@ -185,9 +191,20 @@ func (c *Chimera) streamTCP(ctx context.Context, conn net.Conn, metadata *C.Meta
 }
 
 func (c *Chimera) streamQUIC(ctx context.Context, metadata *C.Metadata) (net.Conn, error) {
-	client, err := chimera.DialQuic(ctx, c.addr, c.option.SNI, c.quicAuthKey, c.quicFP)
+	tlsConfig, err := chimera.NewPinnedTLSConfig(c.option.SNI, c.quicFP)
+	if err != nil {
+		return nil, fmt.Errorf("%s QUIC TLS: %w", c.addr, err)
+	}
+	quicConfig := chimera.DefaultQUICConfig(false)
+	packetConn, quicConn, err := common.DialQuic(ctx, c.addr, c.DialOptions(), c.dialer, tlsConfig, quicConfig, common.DialQuicOption{ConnectionIDLength: 20})
 	if err != nil {
 		return nil, fmt.Errorf("%s QUIC dial: %w", c.addr, err)
+	}
+	client, err := chimera.NewQuicClientFromConn(quicConn, packetConn, c.option.SNI, c.quicAuthKey, false)
+	if err != nil {
+		_ = packetConn.Close()
+		_ = quicConn.CloseWithError(0, "client setup failed")
+		return nil, fmt.Errorf("%s QUIC client: %w", c.addr, err)
 	}
 	stream, err := client.DialTarget(ctx, metadataToChimeraAddr(metadata))
 	if err != nil {
@@ -195,6 +212,33 @@ func (c *Chimera) streamQUIC(ctx context.Context, metadata *C.Metadata) (net.Con
 		return nil, fmt.Errorf("%s QUIC target: %w", c.addr, err)
 	}
 	return stream, nil
+}
+
+func (c *Chimera) listenPacketQUIC(ctx context.Context, metadata *C.Metadata) (net.PacketConn, error) {
+	if c.listenPacketQUICFn != nil {
+		return c.listenPacketQUICFn(ctx, metadata)
+	}
+	tlsConfig, err := chimera.NewPinnedTLSConfig(c.option.SNI, c.quicFP)
+	if err != nil {
+		return nil, fmt.Errorf("%s QUIC TLS: %w", c.addr, err)
+	}
+	quicConfig := chimera.DefaultQUICConfig(true)
+	packetConn, quicConn, err := common.DialQuic(ctx, c.addr, c.DialOptions(), c.dialer, tlsConfig, quicConfig, common.DialQuicOption{ConnectionIDLength: 20})
+	if err != nil {
+		return nil, fmt.Errorf("%s QUIC dial: %w", c.addr, err)
+	}
+	client, err := chimera.NewQuicClientFromConn(quicConn, packetConn, c.option.SNI, c.quicAuthKey, true)
+	if err != nil {
+		_ = packetConn.Close()
+		_ = quicConn.CloseWithError(0, "client setup failed")
+		return nil, fmt.Errorf("%s QUIC client: %w", c.addr, err)
+	}
+	packetConn, err = client.DialUDPMux(ctx)
+	if err != nil {
+		_ = client.Close()
+		return nil, fmt.Errorf("%s QUIC UDP: %w", c.addr, err)
+	}
+	return packetConn, nil
 }
 
 func (c *Chimera) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, error) {
@@ -205,8 +249,21 @@ func (c *Chimera) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn
 	return NewConn(conn, c), nil
 }
 
-func (c *Chimera) ListenPacketContext(context.Context, *C.Metadata) (C.PacketConn, error) {
-	return nil, errors.New("chimera: UDP ASSOCIATE is not implemented")
+func (c *Chimera) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (C.PacketConn, error) {
+	if c.Base == nil || !c.Base.SupportUDP() {
+		return nil, errors.New("chimera: UDP is disabled")
+	}
+	if c.quicMode == "tcp" {
+		return nil, errors.New("chimera: TCP mode does not support UDP")
+	}
+	if c.quicMode != "quic" && c.quicMode != "auto" {
+		return nil, fmt.Errorf("chimera: unknown mode %q", c.quicMode)
+	}
+	pc, err := c.listenPacketQUIC(ctx, metadata)
+	if err != nil {
+		return nil, err
+	}
+	return NewPacketConn(pc, c), nil
 }
 
 func (c *Chimera) ProxyInfo() C.ProxyInfo {
@@ -275,13 +332,17 @@ func NewChimera(option ChimeraOption) (*Chimera, error) {
 	}
 
 	addr := net.JoinHostPort(option.Server, strconv.Itoa(option.Port))
+	udpEnabled := mode != "tcp"
+	if option.UDP != nil {
+		udpEnabled = udpEnabled && *option.UDP
+	}
 	outbound := &Chimera{
 		Base: NewBase(BaseOption{
 			Name:         option.Name,
 			Addr:         addr,
 			Type:         C.Chimera,
 			ProviderName: option.ProviderName,
-			UDP:          false,
+			UDP:          udpEnabled,
 			TFO:          option.TFO,
 			MPTCP:        option.MPTCP,
 			Interface:    option.Interface,
